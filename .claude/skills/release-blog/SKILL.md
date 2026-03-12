@@ -114,8 +114,19 @@ Read `release-blog/research.json` and write `release-blog/blog_post_{next_versio
 **Intro paragraph formula:**
 > "The Argo CD community is thrilled to announce Argo CD vX.Y! This release delivers [N] new features and [N] bug fixes, with highlights including [2–3 themes]. We encourage the community to test the release candidate and share feedback before the final release."
 
-**Conclusion formula (2 sentences):**
-> "Argo CD vX.Y is the result of contributions from dozens of community members. Please test the RC against your environments and report any issues on GitHub; see the upgrade guide for any breaking changes."
+**Conclusion** - add this to the bottom of the article
+```
+## Where Can I Get the New Release?
+For installation instructions and the full changelog, check out the [release notes](https://github.com/argoproj/argo-cd/releases).
+
+We’d love to hear your feedback! Find us on the [#argo-cd](https://cloud-native.slack.com/archives/C01TSERG0KZ) channel in [CNCF Slack](https://slack.cncf.io/) to share your experience, report issues, or just say hi.
+
+---
+
+## Thank You
+
+A huge thanks to all Argo Community contributors and users for their contributions, feedback, and help in testing the release!
+```
 
 ## Categorization Rules
 
