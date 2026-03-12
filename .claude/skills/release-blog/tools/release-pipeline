@@ -1,0 +1,602 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""
+release-pipeline — GitHub release blog post pipeline tool.
+
+Commands:
+  commits     Extract commits not in a tag and resolve PR numbers
+  fetch-prs   Batch-fetch PR metadata via GraphQL
+  categorize  Classify and score PRs into blog categories
+  research    Deep-fetch PR/issue body + comments for selected PRs
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def check_gh_auth():
+    """Abort if gh is not authenticated."""
+    result = subprocess.run(
+        ["gh", "auth", "status"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print("[error] gh is not authenticated. Run: gh auth login", file=sys.stderr)
+        print(result.stderr.strip(), file=sys.stderr)
+        sys.exit(1)
+
+
+def gh(*args, fail_ok=False):
+    """Run a gh CLI command and return parsed JSON or raw text."""
+    result = subprocess.run(["gh"] + list(args), capture_output=True, text=True)
+    if result.returncode != 0 and not fail_ok:
+        print(json.dumps({"error": result.stderr.strip()}), file=sys.stderr)
+        sys.exit(1)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return result.stdout.strip()
+
+
+def gh_graphql(query):
+    """Run a GraphQL query against the GitHub API.
+
+    GitHub returns both 'data' and 'errors' for partial failures (e.g. a PR not
+    found). We log warnings and return the valid partial data instead of aborting.
+    """
+    result = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={query}"],
+        capture_output=True, text=True
+    )
+    # gh writes the JSON response to stdout even on non-zero exit (partial response)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(json.dumps({"error": result.stderr.strip() or "empty GraphQL response"}), file=sys.stderr)
+        sys.exit(1)
+
+    if "errors" in payload:
+        for e in payload["errors"]:
+            path = ".".join(str(p) for p in e.get("path", []))
+            print(f"[graphql] warning: {e.get('message', 'unknown')} (path: {path})", file=sys.stderr)
+
+    if "data" not in payload:
+        print(json.dumps({"error": result.stderr.strip() or "no data in GraphQL response"}), file=sys.stderr)
+        sys.exit(1)
+
+    return payload.get("data", {})
+
+
+def repo_from_remote(remote_name):
+    """Return owner/repo by resolving a named git remote URL."""
+    result = subprocess.run(
+        ["git", "remote", "get-url", remote_name], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    m = re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$', url)
+    return m.group(1) if m else None
+
+
+def detect_repo(remote=None):
+    """Detect GitHub owner/repo from git remotes.
+
+    If --remote is specified, use that remote directly.
+    Otherwise prefer 'upstream' over 'origin' (common OSS fork workflow).
+    If neither exists, list available remotes and ask the user to pass --remote.
+    """
+    if remote:
+        repo = repo_from_remote(remote)
+        if repo:
+            print(f"[detect] Using remote '{remote}' → {repo}", file=sys.stderr)
+            return repo
+        print(f"[error] Remote '{remote}' not found or not a GitHub URL.", file=sys.stderr)
+        return None
+
+    remotes_result = subprocess.run(["git", "remote"], capture_output=True, text=True)
+    remotes = remotes_result.stdout.strip().splitlines()
+    for preferred in ("upstream", "origin"):
+        if preferred in remotes:
+            repo = repo_from_remote(preferred)
+            if repo:
+                print(f"[detect] Using remote '{preferred}' → {repo}", file=sys.stderr)
+                return repo
+    if remotes:
+        print(f"[error] Could not auto-detect repo from remotes: {', '.join(remotes)}", file=sys.stderr)
+        print("[error] Pass --remote <name> to select one explicitly.", file=sys.stderr)
+    return None
+
+
+def detect_latest_tag():
+    result = subprocess.run(
+        ["git", "describe", "--tags", "--abbrev=0"], capture_output=True, text=True
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def extract_issues_from_body(body):
+    """Extract linked issue numbers from a PR body."""
+    if not body:
+        return []
+    patterns = [
+        r'(?:closes?|fixed?s?|resolves?)[:\s]+(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#(\d+)',
+        r'(?:closes?|fixed?s?|resolves?)[:\s]+https://github\.com/[^/]+/[^/]+/issues/(\d+)',
+    ]
+    issues = set()
+    for p in patterns:
+        for m in re.finditer(p, body, re.IGNORECASE):
+            issues.add(int(m.group(1)))
+    return sorted(issues)
+
+
+# ---------------------------------------------------------------------------
+# Command: commits
+# ---------------------------------------------------------------------------
+
+def cmd_commits(args):
+    repo = args.repo or detect_repo(getattr(args, "remote", None))
+    tag = args.tag or detect_latest_tag()
+    if not repo:
+        print('{"error": "Cannot detect repo. Use --repo owner/repo"}', file=sys.stderr)
+        sys.exit(1)
+    if not tag:
+        print('{"error": "Cannot detect latest tag. Use --tag vX.Y.Z"}', file=sys.stderr)
+        sys.exit(1)
+
+    result = subprocess.run(
+        ["git", "log", f"{tag}..HEAD", "--format=%H|%s"],
+        capture_output=True, text=True
+    )
+    commits_raw = [line for line in result.stdout.strip().splitlines() if line]
+    owner, repo_name = repo.split("/", 1)
+
+    output = []
+    unresolved = []
+    pr_inline_re = re.compile(r'\(#(\d+)\)')
+    pr_merge_re  = re.compile(r'Merge pull request #(\d+)')
+
+    for line in commits_raw:
+        sha, subject = line.split("|", 1)
+        pr_num = None
+        m = pr_inline_re.search(subject)
+        if m:
+            pr_num = int(m.group(1))
+        else:
+            m = pr_merge_re.search(subject)
+            if m:
+                pr_num = int(m.group(1))
+        if pr_num:
+            output.append({
+                "sha": sha, "short_sha": sha[:9], "subject": subject,
+                "pr_num": pr_num,
+                "pr_url": f"https://github.com/{repo}/pull/{pr_num}"
+            })
+        else:
+            unresolved.append({"sha": sha, "subject": subject})
+
+    # API fallback for commits without embedded PR numbers
+    if unresolved:
+        print(f"[commits] Resolving {len(unresolved)} commits via API...", file=sys.stderr)
+        for c in unresolved:
+            prs = gh("api", f"repos/{repo}/commits/{c['sha']}/pulls",
+                     "--jq", ".[0].number", fail_ok=True)
+            pr_num = int(prs) if prs and str(prs).isdigit() else None
+            entry = {"sha": c["sha"], "short_sha": c["sha"][:9], "subject": c["subject"],
+                     "pr_num": pr_num,
+                     "pr_url": f"https://github.com/{repo}/pull/{pr_num}" if pr_num else None}
+            output.append(entry)
+
+    # Batch-validate all extracted PR numbers against the target repo.
+    # Commits from fork branches may embed PR numbers that don't exist upstream.
+    all_pr_nums = list({c["pr_num"] for c in output if c.get("pr_num")})
+    if all_pr_nums:
+        print(f"[commits] Validating {len(all_pr_nums)} PR numbers against {repo}...", file=sys.stderr)
+        valid_prs = set()
+        val_batch_size = 50
+        for i in range(0, len(all_pr_nums), val_batch_size):
+            batch = all_pr_nums[i:i + val_batch_size]
+            fields = "\n".join([f'pr{n}: pullRequest(number: {n}) {{ number }}' for n in batch])
+            query = f'{{ repository(owner: "{owner}", name: "{repo_name}") {{ {fields} }} }}'
+            data = gh_graphql(query).get("repository", {})
+            for key, pr in data.items():
+                if pr:
+                    valid_prs.add(pr["number"])
+        excluded = len(all_pr_nums) - len(valid_prs)
+        if excluded:
+            print(f"[commits] {excluded} PR number(s) not found in {repo} (fork/deleted) — excluded", file=sys.stderr)
+        output = [c for c in output if c.get("pr_num") is None or c["pr_num"] in valid_prs]
+
+    print(f"[commits] {len(output)} commits, {len([x for x in output if x['pr_num']])} with PR numbers", file=sys.stderr)
+    result_json = json.dumps(output, indent=2)
+    if args.output:
+        Path(args.output).write_text(result_json)
+        print(f"[commits] Written to {args.output}", file=sys.stderr)
+    else:
+        print(result_json)
+
+
+# ---------------------------------------------------------------------------
+# Command: fetch-prs
+# ---------------------------------------------------------------------------
+
+def cmd_fetch_prs(args):
+    repo = args.repo or detect_repo(getattr(args, "remote", None))
+    commits = json.loads(Path(args.input).read_text())
+    owner, repo_name = repo.split("/", 1)
+
+    # Deduplicate PR numbers (preserving order for first-seen)
+    seen = set()
+    pr_numbers = []
+    for c in commits:
+        n = c.get("pr_num")
+        if n and n not in seen:
+            seen.add(n)
+            pr_numbers.append(n)
+
+    print(f"[fetch-prs] Fetching {len(pr_numbers)} unique PRs in batches of 50...", file=sys.stderr)
+
+    pr_data = {}
+    batch_size = 50
+    for i in range(0, len(pr_numbers), batch_size):
+        batch = pr_numbers[i:i + batch_size]
+        fields = "\n".join([
+            f'pr{n}: pullRequest(number: {n}) {{ number title body labels(first: 20) {{ nodes {{ name }} }} }}'
+            for n in batch
+        ])
+        query = f'{{ repository(owner: "{owner}", name: "{repo_name}") {{ {fields} }} }}'
+        data = gh_graphql(query).get("repository", {})
+        skipped = 0
+        for key, pr in data.items():
+            if pr:
+                pr_data[pr["number"]] = pr
+            else:
+                skipped += 1
+        skip_msg = f", {skipped} skipped (not found in repo)" if skipped else ""
+        print(f"[fetch-prs]   batch {i // batch_size + 1}/{-(-len(pr_numbers) // batch_size)} done{skip_msg}", file=sys.stderr)
+
+    total_skipped = len(pr_numbers) - len(pr_data)
+    if total_skipped:
+        print(f"[fetch-prs] {total_skipped} PR(s) not found in {repo} (fork-specific or deleted) — skipped", file=sys.stderr)
+
+    # Build markdown table
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"# Pull Requests since {args.tag or detect_latest_tag() or 'last tag'}",
+        "",
+        f"_Generated: {now} | {len(pr_data)} unique PRs_",
+        "",
+        "| PR | Title | Issues | Labels |",
+        "|----|-------|--------|--------|",
+    ]
+    for n in pr_numbers:
+        pr = pr_data.get(n)
+        if not pr:
+            continue
+        pr_link = f"[#{n}](https://github.com/{repo}/pull/{n})"
+        title = pr["title"].replace("|", "\\|")
+        issues = extract_issues_from_body(pr.get("body") or "")
+        issues_cell = "<br>".join(f"[#{i}](https://github.com/{repo}/issues/{i})" for i in issues)
+        labels = [lbl["name"] for lbl in pr.get("labels", {}).get("nodes", [])]
+        labels_cell = "<br>".join(f"`{l}`" for l in labels)
+        lines.append(f"| {pr_link} | {title} | {issues_cell} | {labels_cell} |")
+
+    output_text = "\n".join(lines) + "\n"
+    if args.output:
+        Path(args.output).write_text(output_text)
+        print(f"[fetch-prs] Written to {args.output}", file=sys.stderr)
+    else:
+        print(output_text)
+
+
+# ---------------------------------------------------------------------------
+# Command: categorize
+# ---------------------------------------------------------------------------
+
+CATEGORIES = [
+    "blog_highlights", "new_features", "notable_bug_fixes",
+    "other_bug_fixes", "documentation", "dependency_updates", "maintenance",
+]
+
+CATEGORY_NAMES = {
+    "blog_highlights":   "Blog Highlights",
+    "new_features":      "New Features",
+    "notable_bug_fixes": "Notable Bug Fixes",
+    "other_bug_fixes":   "Other Bug Fixes",
+    "documentation":     "Documentation",
+    "dependency_updates":"Dependency Updates",
+    "maintenance":       "Maintenance",
+}
+
+ROW_RE = re.compile(
+    r'^\| \[#(\d+)\]\((https://github\.com/[^)]+)\) \| (.+?) \| (.*?) \| (.*?) \|$'
+)
+
+
+def parse_issues_cell(cell):
+    return re.findall(r'\[#\d+\]\([^)]+\)', cell)
+
+
+def parse_labels_cell(cell):
+    if not cell.strip():
+        return []
+    return [p.strip().strip('`') for p in cell.split('<br>') if p.strip().strip('`')]
+
+
+def classify_pr(pr, stable_branch_label=None):
+    title  = pr['title']
+    labels = pr['labels']
+
+    if any(re.match(r'for-release-blog', lbl) for lbl in labels):
+        return "blog_highlights"
+    if re.match(r'^feat(\([^)]+\))?:', title):
+        return "new_features"
+    if re.match(r'^fix(\([^)]+\))?:', title):
+        has_issues = bool(pr['issues'])
+        has_major  = 'major' in labels
+        has_cp     = any(re.match(r'cherry-pick/', lbl) for lbl in labels)
+        if has_issues or has_major or has_cp:
+            return "notable_bug_fixes"
+        return "other_bug_fixes"
+    if re.match(r'^docs(\([^)]+\))?:', title) or re.match(r'^\[Bot\]\s+docs:', title):
+        return "documentation"
+    if re.match(r'^chore\(deps\):', title) or 'dependencies' in labels:
+        return "dependency_updates"
+    return "maintenance"
+
+
+def score_pr(pr):
+    score  = 0
+    labels = pr['labels']
+    if any(re.match(r'for-release-blog', lbl) for lbl in labels):
+        score += 100
+    if 'major' in labels:
+        score += 50
+    if pr['issues']:
+        score += 20
+    # cherry-pick labels — latest branch scores highest
+    cp_labels = sorted([l for l in labels if re.match(r'cherry-pick/', l)], reverse=True)
+    if cp_labels:
+        score += 15  # at least one cherry-pick
+        if len(cp_labels) >= 2:
+            score += 10  # backported to multiple branches
+    if any(lbl.startswith('component:') for lbl in labels):
+        score += 10
+    if 'type:scalability' in labels or 'type:tech-debt' in labels:
+        score += 5
+    return score
+
+
+def cmd_categorize(args):
+    text = Path(args.input).read_text(encoding='utf-8')
+    buckets = defaultdict(list)
+    total = 0
+
+    for line in text.splitlines():
+        m = ROW_RE.match(line)
+        if not m:
+            continue
+        pr_num, pr_url, title, issues_cell, labels_cell = m.groups()
+        pr = {
+            'pr_num': int(pr_num), 'pr_url': pr_url,
+            'title':  title.strip(),
+            'issues': parse_issues_cell(issues_cell),
+            'labels': parse_labels_cell(labels_cell),
+        }
+        pr['score']    = score_pr(pr)
+        pr['category'] = classify_pr(pr)
+        buckets[pr['category']].append(pr)
+        total += 1
+
+    for cat in CATEGORIES:
+        buckets[cat].sort(key=lambda p: (-p['score'], p['pr_num']))
+
+    # Detect repo from URL of first PR
+    repo_url_m = re.search(r'https://github\.com/([^/]+/[^/]+)/pull/', text)
+    repo = repo_url_m.group(1) if repo_url_m else "owner/repo"
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    out = [
+        "# PR Categorization for Release Blog\n",
+        f"_Generated: {now} | Source: `{Path(args.input).name}` | {total} PRs_\n",
+        "## Summary\n",
+        "| Category | Count |",
+        "|----------|-------|",
+    ]
+    for cat in CATEGORIES:
+        out.append(f"| {CATEGORY_NAMES[cat]} | {len(buckets[cat])} |")
+    out.append(f"| **Total** | **{total}** |")
+    out.append("")
+
+    for cat in CATEGORIES:
+        prs  = buckets[cat]
+        name = CATEGORY_NAMES[cat]
+        out.append(f"## {name} ({len(prs)})\n")
+        if cat == "dependency_updates":
+            out.append(f"_{len(prs)} automated dependency update PRs — omit from blog post._\n")
+            continue
+        if not prs:
+            out.append("_No PRs in this category._\n")
+            continue
+        out.append("| PR | Title | Issues | Labels | Score |")
+        out.append("|----|-------|--------|--------|-------|")
+        for pr in prs:
+            issues_cell = "<br>".join(pr['issues'])
+            labels_cell = "<br>".join(f"`{l}`" for l in pr['labels'])
+            out.append(
+                f"| [#{pr['pr_num']}]({pr['pr_url']}) "
+                f"| {pr['title']} "
+                f"| {issues_cell} "
+                f"| {labels_cell} "
+                f"| {pr['score']} |"
+            )
+        out.append("")
+
+    output_text = "\n".join(out)
+    if args.output:
+        Path(args.output).write_text(output_text)
+        print(f"[categorize] Written to {args.output} ({total} PRs)", file=sys.stderr)
+        for cat in CATEGORIES:
+            print(f"  {CATEGORY_NAMES[cat]}: {len(buckets[cat])}", file=sys.stderr)
+    else:
+        print(output_text)
+
+
+# ---------------------------------------------------------------------------
+# Command: research
+# ---------------------------------------------------------------------------
+
+def cmd_research(args):
+    repo = args.repo or detect_repo()
+    owner, repo_name = repo.split("/", 1)
+    pr_nums = [int(n.strip()) for n in args.prs.split(",") if n.strip().isdigit()]
+
+    print(f"[research] Fetching details for {len(pr_nums)} PRs...", file=sys.stderr)
+
+    # Batch 1: PR title + body + labels for all selected PRs
+    fields = "\n".join([
+        f'pr{n}: pullRequest(number: {n}) {{ number title body labels(first:20) {{ nodes {{ name }} }} }}'
+        for n in pr_nums
+    ])
+    query = f'{{ repository(owner: "{owner}", name: "{repo_name}") {{ {fields} }} }}'
+    pr_data = gh_graphql(query).get("repository", {})
+
+    # Extract all issue numbers referenced across all selected PRs
+    all_issues = {}
+    pr_to_issues = {}
+    for key, pr in pr_data.items():
+        if not pr:
+            continue
+        issues = extract_issues_from_body(pr.get("body") or "")
+        pr_to_issues[pr["number"]] = issues
+        for i in issues:
+            all_issues[i] = None
+
+    # Batch 2: Issue title + body for all linked issues
+    if all_issues:
+        issue_nums = list(all_issues.keys())
+        ifields = "\n".join([
+            f'issue{n}: issue(number: {n}) {{ number title body }}'
+            for n in issue_nums
+        ])
+        iquery = f'{{ repository(owner: "{owner}", name: "{repo_name}") {{ {ifields} }} }}'
+        issue_data = gh_graphql(iquery).get("repository", {})
+        for key, issue in issue_data.items():
+            if issue:
+                all_issues[issue["number"]] = issue
+
+    # Sequential: PR comments + issue comments for each selected PR
+    results = []
+    for n in pr_nums:
+        key = f"pr{n}"
+        pr = pr_data.get(key)
+        if not pr:
+            print(f"[research] PR #{n} not found", file=sys.stderr)
+            continue
+
+        # PR comments (top 10, trim long ones)
+        pr_comments_raw = gh("api", f"repos/{repo}/issues/{n}/comments",
+                              "--jq", "[.[] | {author: .user.login, body: .body}]",
+                              fail_ok=True)
+        pr_comments = pr_comments_raw[:10] if isinstance(pr_comments_raw, list) else []
+
+        # PR diff for additional context
+        diff_raw = gh("pr", "diff", str(n), "--repo", repo, fail_ok=True)
+        pr_diff = diff_raw[:5000] if isinstance(diff_raw, str) else ""
+
+        # Build issue entries
+        issues_detail = []
+        for issue_num in pr_to_issues.get(n, []):
+            issue = all_issues.get(issue_num)
+            if not issue:
+                continue
+            # Issue comments (top 5)
+            ic_raw = gh("api", f"repos/{repo}/issues/{issue_num}/comments",
+                         "--jq", "[.[] | {author: .user.login, body: .body}]",
+                         fail_ok=True)
+            ic = ic_raw[:5] if isinstance(ic_raw, list) else []
+            issues_detail.append({
+                "number": issue_num,
+                "title": issue.get("title", ""),
+                "body": (issue.get("body") or "")[:3000],
+                "comments": [{"author": c.get("author",""), "body": (c.get("body") or "")[:500]} for c in ic],
+                "url": f"https://github.com/{repo}/issues/{issue_num}",
+            })
+
+        results.append({
+            "pr_num": n,
+            "pr_url": f"https://github.com/{repo}/pull/{n}",
+            "title": pr.get("title", ""),
+            "body": (pr.get("body") or "")[:4000],
+            "labels": [lbl["name"] for lbl in pr.get("labels", {}).get("nodes", [])],
+            "comments": [{"author": c.get("author",""), "body": (c.get("body") or "")[:500]} for c in pr_comments],
+            "issues": issues_detail,
+            "diff": pr_diff,
+        })
+        print(f"[research]   PR #{n}: {len(issues_detail)} issues, {len(pr_comments)} comments, {len(pr_diff)} diff chars", file=sys.stderr)
+
+    output_text = json.dumps(results, indent=2)
+    if args.output:
+        Path(args.output).write_text(output_text)
+        print(f"[research] Written to {args.output}", file=sys.stderr)
+    else:
+        print(output_text)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Release blog post pipeline tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # commits
+    p = sub.add_parser("commits", help="Get commits not in tag and resolve PR numbers")
+    p.add_argument("--repo",   help="owner/repo (default: detect from git remote)")
+    p.add_argument("--remote", help="Git remote to use for repo detection (default: 'upstream' then 'origin')")
+    p.add_argument("--tag",    help="Release tag to diff against (default: latest tag)")
+    p.add_argument("-o", "--output", help="Output JSON file path")
+
+    # fetch-prs
+    p = sub.add_parser("fetch-prs", help="Batch-fetch PR metadata via GraphQL")
+    p.add_argument("--repo",   help="owner/repo (default: detect from git remote)")
+    p.add_argument("--remote", help="Git remote to use for repo detection (default: 'upstream' then 'origin')")
+    p.add_argument("--tag",    help="Tag label for output header")
+    p.add_argument("--input",  required=True, help="commits.json from 'commits' command")
+    p.add_argument("-o", "--output", help="Output markdown file path")
+
+    # categorize
+    p = sub.add_parser("categorize", help="Classify and score PRs into blog categories")
+    p.add_argument("--input", required=True, help="prs_detailed.md from 'fetch-prs' command")
+    p.add_argument("-o", "--output", help="Output markdown file path")
+
+    # research
+    p = sub.add_parser("research", help="Deep-fetch PR/issue body + comments for selected PRs")
+    p.add_argument("--repo", help="owner/repo (default: detect from git remote)")
+    p.add_argument("--prs",  required=True, help="Comma-separated PR numbers to research")
+    p.add_argument("-o", "--output", help="Output JSON file path")
+
+    args = parser.parse_args()
+    if args.command != "categorize":
+        check_gh_auth()
+    {"commits": cmd_commits, "fetch-prs": cmd_fetch_prs,
+     "categorize": cmd_categorize, "research": cmd_research}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
